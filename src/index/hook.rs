@@ -118,6 +118,18 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
 
 static mut PREV_EXECUTOR_START: pgrx::pg_sys::ExecutorStart_hook_type = None;
 
+mod unchecked {
+    // Declared directly rather than through `pgrx::pg_sys`: every wrapped call runs pgrx's
+    // "Postgres FFI may not be called from multiple threads" check, which aborts the process.
+    unsafe extern "C-unwind" {
+        #[link_name = "standard_ExecutorStart"]
+        pub(super) fn standard_executor_start(
+            query_desc: *mut pgrx::pg_sys::QueryDesc,
+            eflags: core::ffi::c_int,
+        );
+    }
+}
+
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn executor_start(
     query_desc: *mut pgrx::pg_sys::QueryDesc,
@@ -126,6 +138,17 @@ unsafe extern "C-unwind" fn executor_start(
     unsafe {
         use core::ptr::null_mut;
         use pgrx::pg_sys::submodules::ffi::pg_guard_ffi_boundary;
+        if !crate::is_main() {
+            // Another extension (pg_duckdb's scan workers, pg_ducklake) runs the executor on a
+            // helper thread. Postgres FFI through pgrx would abort the whole server there, so
+            // chain to the next hook without it and skip the plan-state rewrite.
+            #[allow(ffi_unwind_calls, reason = "the next hook is a plain C function")]
+            match PREV_EXECUTOR_START {
+                Some(prev_executor_start) => prev_executor_start(query_desc, eflags),
+                None => unchecked::standard_executor_start(query_desc, eflags),
+            }
+            return;
+        }
         if let Some(prev_executor_start) = PREV_EXECUTOR_START {
             #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
             pg_guard_ffi_boundary(|| prev_executor_start(query_desc, eflags))

@@ -26,6 +26,15 @@ unsafe extern "C-unwind" fn recorder_object_access(
 ) {
     unsafe {
         use pgrx::pg_sys::submodules::ffi::pg_guard_ffi_boundary;
+        if !crate::is_main() {
+            // Called on a helper thread (see `index::hook::executor_start`): pgrx aborts the
+            // server on any wrapped Postgres call there, so only chain to the next hook.
+            if let Some(prev_object_access_hook) = PREV_OBJECT_ACCESS {
+                #[allow(ffi_unwind_calls, reason = "the next hook is a plain C function")]
+                prev_object_access_hook(access, class_id, object_id, sub_id, arg);
+            }
+            return;
+        }
         if let Some(prev_object_access_hook) = PREV_OBJECT_ACCESS {
             #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
             pg_guard_ffi_boundary(|| {
